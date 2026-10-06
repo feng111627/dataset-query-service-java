@@ -1,0 +1,21 @@
+<configuration>
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level [%logger{16}] %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- 业务测试日志：逐条打印用例及其结果 -->
+    <logger name="BUSINESS-TEST" level="INFO" additivity="false">
+        <appender-ref ref="CONSOLE"/>
+    </logger>
+
+    <!-- 抑制 Spring 启动噪声，保留测试结果可读性 -->
+    <logger name="org.springframework" level="WARN"/>
+    <logger name="org.apache.tomcat" level="WARN"/>
+    <logger name="com.zaxxer.hikari" level="WARN"/>
+
+    <root level="WARN">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>
