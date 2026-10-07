@@ -2,10 +2,12 @@ package com.github.feng111627.datasetqueryservicejava.service;
 
 import com.github.feng111627.datasetqueryservicejava.error.ClientException;
 import com.github.feng111627.datasetqueryservicejava.error.ErrorCode;
+import com.github.feng111627.datasetqueryservicejava.model.BackfillRequest;
 import com.github.feng111627.datasetqueryservicejava.model.DatasetSchema;
 import com.github.feng111627.datasetqueryservicejava.model.FieldDef;
 import com.github.feng111627.datasetqueryservicejava.model.QueryRequest;
 import com.github.feng111627.datasetqueryservicejava.model.QueryResult;
+import com.github.feng111627.datasetqueryservicejava.model.SchemaVersion;
 import com.github.feng111627.datasetqueryservicejava.model.Snapshot;
 import com.github.feng111627.datasetqueryservicejava.query.QueryEngine;
 import com.github.feng111627.datasetqueryservicejava.schema.SchemaCompatibility;
@@ -15,6 +17,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -36,16 +39,17 @@ public class DatasetService {
         this.queryEngine = queryEngine;
     }
 
-    /** Registers (or compatibly re-registers) a dataset schema. */
+    /**
+     * Registers a dataset schema, or applies a compatible evolution of an
+     * existing one. An accepted evolution takes effect immediately: later
+     * writes may carry the new fields, schema lookups return the latest
+     * fields, and the new fields can be selected, filtered and aggregated.
+     * Records written before the evolution are untouched and simply have no
+     * value for the new fields.
+     */
     public DatasetSchema registerSchema(DatasetSchema schema) {
         validateSchemaDeclaration(schema);
-        DatasetSchema existing = store.schemaOf(schema.name());
-        if (existing != null) {
-            compatibility.checkCompatible(existing, schema);
-            // compatible re-registration keeps the already stored data and schema
-            return existing;
-        }
-        return store.registerSchema(schema);
+        return store.registerOrEvolve(schema, compatibility::checkCompatible);
     }
 
     public DatasetSchema schemaOf(String dataset) {
@@ -55,6 +59,12 @@ public class DatasetService {
                     "dataset '" + dataset + "' is not registered");
         }
         return schema;
+    }
+
+    /** Returns the accepted schema evolution history (version 1 = initial). */
+    public List<SchemaVersion> schemaHistory(String dataset) {
+        schemaOf(dataset); // 404 for unknown datasets
+        return store.schemaHistory(dataset);
     }
 
     /** Validates and appends records; returns assigned sequence numbers. */
@@ -88,6 +98,52 @@ public class DatasetService {
                     allProblems);
         }
         return store.append(dataset, records);
+    }
+
+    /**
+     * Backfills a default value for a field onto all currently existing
+     * records that lack a non-null value for it. The operation is atomic
+     * with respect to concurrent writes and reads: any query sees either the
+     * fully pre-backfill or the fully post-backfill state. Snapshot tokens
+     * issued before a data-changing backfill are invalidated (SNAPSHOT_EXPIRED)
+     * so pages never mix pre- and post-backfill records.
+     *
+     * <p>Retries are safe: the same requestId replays the stored outcome
+     * without re-applying anything.</p>
+     */
+    public Map<String, Object> backfill(String dataset, BackfillRequest request) {
+        DatasetSchema schema = schemaOf(dataset);
+        if (request == null) {
+            throw new ClientException(ErrorCode.VALIDATION_ERROR,
+                    "request body must contain 'field', 'value' and 'requestId'");
+        }
+        List<String> problems = new ArrayList<>();
+        FieldDef field = request.field() == null ? null : schema.field(request.field());
+        if (request.field() == null || request.field().isBlank()) {
+            problems.add("field must not be blank");
+        } else if (field == null) {
+            problems.add("unknown field: " + request.field());
+        }
+        if (request.value() == null) {
+            problems.add("value must not be null (backfilling null is a no-op)");
+        }
+        if (request.requestId() == null || request.requestId().isBlank()) {
+            problems.add("requestId must not be blank (it makes retries idempotent)");
+        }
+        if (!problems.isEmpty()) {
+            throw new ClientException(ErrorCode.VALIDATION_ERROR, "invalid backfill request", problems);
+        }
+        validator.validateFieldValue(field, request.value());
+
+        DatasetStore.BackfillOutcome outcome =
+                store.backfill(dataset, request.field(), request.value(), request.requestId());
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("field", outcome.field());
+        result.put("value", outcome.value());
+        result.put("backfilled", outcome.backfilled());
+        result.put("highWaterMark", outcome.highWaterMark());
+        result.put("replayed", outcome.replayed());
+        return result;
     }
 
     public QueryResult query(String dataset, QueryRequest request) {

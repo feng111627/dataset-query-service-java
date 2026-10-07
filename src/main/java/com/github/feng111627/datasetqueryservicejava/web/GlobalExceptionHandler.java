@@ -28,7 +28,7 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiError> handleClient(ClientException ex) {
         HttpStatus status = switch (ex.code()) {
             case SCHEMA_NOT_FOUND -> HttpStatus.NOT_FOUND;
-            case INCOMPATIBLE_SCHEMA -> HttpStatus.CONFLICT;
+            case INCOMPATIBLE_SCHEMA, SNAPSHOT_EXPIRED -> HttpStatus.CONFLICT;
             default -> HttpStatus.BAD_REQUEST;
         };
         return ResponseEntity.status(status)

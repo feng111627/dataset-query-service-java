@@ -197,4 +197,80 @@ class HttpApiTest {
         assertEquals(10, rows.size());
         assertEquals(11, rows.get(0).get("id"));
     }
+
+    @Test
+    @DisplayName("schema evolution over HTTP: new field effective immediately, versioned history queryable")
+    void schemaEvolutionOverHttp() {
+        String ds = "http_evolve";
+        register(ds);
+        rest.postForEntity("/datasets/" + ds + "/records",
+                Map.of("records", List.of(Map.of("id", 1, "price", 10.0))), Map.class);
+
+        // evolve: add optional field 'channel'
+        Map<String, Object> evolved = Map.of("fields", List.of(
+                Map.of("name", "id", "type", "INTEGER", "required", true),
+                Map.of("name", "price", "type", "DOUBLE", "required", true),
+                Map.of("name", "label", "type", "STRING", "required", false),
+                Map.of("name", "channel", "type", "STRING", "required", false)));
+        ResponseEntity<Map> put = rest.exchange("/datasets/" + ds + "/schema",
+                HttpMethod.PUT, json(evolved), Map.class);
+        assertEquals(HttpStatus.OK, put.getStatusCode());
+
+        // the new field is immediately usable: write + filter on it
+        ResponseEntity<Map> write = rest.postForEntity("/datasets/" + ds + "/records",
+                Map.of("records", List.of(Map.of("id", 2, "price", 20.0, "channel", "web"))), Map.class);
+        assertEquals(HttpStatus.CREATED, write.getStatusCode());
+        ResponseEntity<Map> query = rest.postForEntity("/datasets/" + ds + "/query",
+                Map.of("filters", List.of(Map.of("field", "channel", "op", "IS_NULL"))), Map.class);
+        assertEquals(1, ((Number) query.getBody().get("total")).intValue(),
+                "the pre-evolution record reads the new field as null");
+
+        // history: version 1 = initial, version 2 = added 'channel'
+        ResponseEntity<List> history = rest.getForEntity("/datasets/" + ds + "/schema/history", List.class);
+        assertEquals(HttpStatus.OK, history.getStatusCode());
+        List<Map<String, Object>> versions = (List<Map<String, Object>>) (List<?>) history.getBody();
+        assertEquals(2, versions.size());
+        assertEquals(1, ((Number) versions.get(0).get("version")).intValue());
+        assertEquals(List.of("channel"), versions.get(1).get("addedFields"));
+        assertNotNull(versions.get(1).get("effectiveAt"));
+    }
+
+    @Test
+    @DisplayName("backfill over HTTP: fills existing records, replay is idempotent, old snapshot token -> 409 SNAPSHOT_EXPIRED")
+    void backfillOverHttp() {
+        String ds = "http_backfill";
+        register(ds);
+        rest.postForEntity("/datasets/" + ds + "/records",
+                Map.of("records", List.of(
+                        Map.of("id", 1, "price", 10.0),
+                        Map.of("id", 2, "price", 20.0, "label", "keep"))), Map.class);
+
+        ResponseEntity<Map> firstPage = rest.postForEntity("/datasets/" + ds + "/query",
+                Map.of("offset", 0, "limit", 1), Map.class);
+        long token = ((Number) firstPage.getBody().get("snapshotSeq")).longValue();
+
+        ResponseEntity<Map> backfill = rest.postForEntity("/datasets/" + ds + "/backfill",
+                Map.of("field", "label", "value", "unknown", "requestId", "bf-http-1"), Map.class);
+        assertEquals(HttpStatus.OK, backfill.getStatusCode());
+        assertEquals(1, backfill.getBody().get("backfilled"));
+        assertEquals(false, backfill.getBody().get("replayed"));
+
+        // idempotent replay
+        ResponseEntity<Map> replay = rest.postForEntity("/datasets/" + ds + "/backfill",
+                Map.of("field", "label", "value", "unknown", "requestId", "bf-http-1"), Map.class);
+        assertEquals(true, replay.getBody().get("replayed"));
+        assertEquals(1, replay.getBody().get("backfilled"));
+
+        // the pre-backfill snapshot token is now rejected, not silently mixed
+        ResponseEntity<Map> stale = rest.postForEntity("/datasets/" + ds + "/query",
+                Map.of("offset", 1, "limit", 1, "snapshotSeq", token), Map.class);
+        assertEquals(HttpStatus.CONFLICT, stale.getStatusCode());
+        assertEquals("SNAPSHOT_EXPIRED", errorOf(stale).get("code"));
+
+        // fresh queries see the backfilled state
+        ResponseEntity<Map> query = rest.postForEntity("/datasets/" + ds + "/query",
+                Map.of("filters", List.of(Map.of("field", "label", "op", "EQ", "value", "unknown")),
+                        "sort", List.of(Map.of("field", "id", "ascending", true))), Map.class);
+        assertEquals(1, ((Number) query.getBody().get("total")).intValue());
+    }
 }

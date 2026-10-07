@@ -63,6 +63,22 @@ public class SchemaValidator {
         }
     }
 
+    /**
+     * Validates a single value against a field declaration. Throws
+     * ClientException(TYPE_MISMATCH) when the value's type does not match.
+     */
+    public void validateFieldValue(FieldDef field, Object value) {
+        if (value == null) {
+            return; // null means "absent" and is always type-compatible
+        }
+        if (!typeMatches(field, value)) {
+            throw new ClientException(ErrorCode.TYPE_MISMATCH,
+                    "value does not match the declared type of field '" + field.name() + "'",
+                    List.of(field.name() + " (expected " + field.type()
+                            + ", got " + value.getClass().getSimpleName() + ")"));
+        }
+    }
+
     private boolean typeMatches(FieldDef field, Object value) {
         return switch (field.type()) {
             case STRING -> value instanceof String;

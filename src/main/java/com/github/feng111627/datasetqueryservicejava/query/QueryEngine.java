@@ -83,6 +83,8 @@ public class QueryEngine {
                     problems.add("unknown filter field: " + f.field());
                 } else if (f.op() == null) {
                     problems.add("filter on '" + f.field() + "' is missing an operator");
+                } else if (isRangeOp(f.op()) && f.value() == null) {
+                    problems.add("range filter on '" + f.field() + "' requires a non-null value");
                 }
             }
         }
@@ -122,6 +124,13 @@ public class QueryEngine {
         }
     }
 
+    private boolean isRangeOp(QueryRequest.Op op) {
+        return switch (op) {
+            case GT, GTE, LT, LTE -> true;
+            default -> false;
+        };
+    }
+
     private boolean isNumeric(com.github.feng111627.datasetqueryservicejava.model.FieldType type) {
         return type == com.github.feng111627.datasetqueryservicejava.model.FieldType.INTEGER
                 || type == com.github.feng111627.datasetqueryservicejava.model.FieldType.DOUBLE;
@@ -143,13 +152,17 @@ public class QueryEngine {
     private boolean matches(Object actual, QueryRequest.Filter filter) {
         Object expected = filter.value();
         return switch (filter.op()) {
+            case IS_NULL -> actual == null;
+            case IS_NOT_NULL -> actual != null;
             case EQ -> actual == null ? expected == null : actual.equals(expected)
                     || numericEquals(actual, expected);
             case NE -> !matches(actual, new QueryRequest.Filter(filter.field(), QueryRequest.Op.EQ, expected));
-            case GT -> compare(actual, expected) > 0;
-            case GTE -> compare(actual, expected) >= 0;
-            case LT -> compare(actual, expected) < 0;
-            case LTE -> compare(actual, expected) <= 0;
+            // Null field values never match a range comparison; they are
+            // skipped instead of failing the whole query.
+            case GT -> actual != null && compare(actual, expected) > 0;
+            case GTE -> actual != null && compare(actual, expected) >= 0;
+            case LT -> actual != null && compare(actual, expected) < 0;
+            case LTE -> actual != null && compare(actual, expected) <= 0;
         };
     }
 
@@ -181,12 +194,9 @@ public class QueryEngine {
         Comparator<StoredRecord> comparator = null;
         if (sort != null) {
             for (QueryRequest.SortField s : sort) {
-                Comparator<StoredRecord> c = Comparator.comparing(
-                        r -> (Comparable<Object>) r.values().get(s.field()),
-                        Comparator.nullsLast(Comparator.naturalOrder()));
-                if (!s.ascending()) {
-                    c = c.reversed();
-                }
+                Comparator<StoredRecord> c =
+                        (a, b) -> compareForSort(a.values().get(s.field()), b.values().get(s.field()),
+                                s.ascending());
                 comparator = comparator == null ? c : comparator.thenComparing(c);
             }
         }
@@ -195,6 +205,48 @@ public class QueryEngine {
         return comparator == null ? bySeq : comparator.thenComparing(bySeq);
     }
 
+    /**
+     * Sort comparison with uniform null semantics: nulls always sort last,
+     * in both ascending and descending order; numbers compare numerically
+     * even across Integer/Long/Double representations.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private int compareForSort(Object a, Object b, boolean ascending) {
+        // nulls always sort last, independent of the sort direction
+        if (a == null) {
+            return b == null ? 0 : 1;
+        }
+        if (b == null) {
+            return -1;
+        }
+        int cmp;
+        if (a instanceof Number x && b instanceof Number y) {
+            cmp = Double.compare(x.doubleValue(), y.doubleValue());
+        } else if (a instanceof Comparable c && a.getClass().isInstance(b)) {
+            cmp = c.compareTo(b);
+        } else {
+            throw new ClientException(ErrorCode.VALIDATION_ERROR,
+                    "values are not comparable for sorting: " + a.getClass().getSimpleName()
+                            + " vs " + b.getClass().getSimpleName());
+        }
+        if (ascending || cmp == 0) {
+            return cmp;
+        }
+        return cmp < 0 ? 1 : -1;
+    }
+
+    /**
+     * Aggregation null semantics (uniform across filter/sort/page combos,
+     * since aggregations run over the full filtered set before paging):
+     * <ul>
+     *   <li>{@code COUNT} counts matched records, including records whose
+     *       fields are null;</li>
+     *   <li>{@code SUM} / {@code AVG} skip null values; {@code AVG} of an
+     *       all-null (or empty) set is null, {@code SUM} of it is 0.0;</li>
+     *   <li>{@code MIN} / {@code MAX} skip null values and are null when no
+     *       non-null value exists.</li>
+     * </ul>
+     */
     private Map<String, Object> computeAggregations(DatasetSchema schema,
                                                     List<StoredRecord> matched,
                                                     List<QueryRequest.Aggregation> aggregations) {

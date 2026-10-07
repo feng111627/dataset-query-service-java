@@ -180,7 +180,7 @@ class ConcurrentPaginationTest {
     @DisplayName("re-reading a snapshot token after more writes yields identical records")
     void snapshotTokenIsReproducible() {
         DatasetStore store = new DatasetStore();
-        store.registerSchema(SCHEMA);
+        store.registerOrEvolve(SCHEMA, (existing, incoming) -> { });
         store.append("events", records(1, 20));
         Snapshot first = store.snapshot("events");
         store.append("events", records(21, 40));

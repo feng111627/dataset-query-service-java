@@ -20,7 +20,19 @@ public record QueryRequest(
     public record Filter(String field, Op op, Object value) {
     }
 
-    public enum Op { EQ, NE, GT, GTE, LT, LTE }
+    /**
+     * Filter operators. Null semantics:
+     * <ul>
+     *   <li>{@code IS_NULL} / {@code IS_NOT_NULL} test explicitly whether a
+     *       field is absent-or-null on a record (value is ignored);</li>
+     *   <li>range operators ({@code GT} {@code GTE} {@code LT} {@code LTE})
+     *       never fail on null field values: a record whose field is null
+     *       simply does not match;</li>
+     *   <li>{@code EQ} with a null value behaves like {@code IS_NULL},
+     *       {@code NE} with a null value like {@code IS_NOT_NULL}.</li>
+     * </ul>
+     */
+    public enum Op { EQ, NE, GT, GTE, LT, LTE, IS_NULL, IS_NOT_NULL }
 
     public record Aggregation(AggFunc func, String field, String alias) {
     }
