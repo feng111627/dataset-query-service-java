@@ -60,7 +60,7 @@ class ConcurrentPaginationTest {
     void paginationIsStableUnderConcurrentWrites() throws Exception {
         DatasetStore store = new DatasetStore();
         DatasetService service = newService(store);
-        service.registerSchema(SCHEMA);
+        service.registerSchema(SCHEMA).schema();
         service.writeRecords("events", records(1, 100));
 
         // Pin the snapshot BEFORE any concurrent write lands: the first page
@@ -129,7 +129,7 @@ class ConcurrentPaginationTest {
     void defaultOrderIsStableAndReproducible() {
         DatasetStore store = new DatasetStore();
         DatasetService service = newService(store);
-        service.registerSchema(SCHEMA);
+        service.registerSchema(SCHEMA).schema();
         service.writeRecords("events", records(1, 50));
 
         QueryRequest request = new QueryRequest(null, List.of("id"), null, null, 0, 50, null);
@@ -146,7 +146,7 @@ class ConcurrentPaginationTest {
     void sortTieBreakIsDeterministic() {
         DatasetStore store = new DatasetStore();
         DatasetService service = newService(store);
-        service.registerSchema(SCHEMA);
+        service.registerSchema(SCHEMA).schema();
         // 30 records, only 3 distinct 'value' keys -> heavy ties.
         List<Map<String, Object>> records = new ArrayList<>();
         for (int i = 1; i <= 30; i++) {

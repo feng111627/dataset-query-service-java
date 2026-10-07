@@ -2,10 +2,13 @@ package com.github.feng111627.datasetqueryservicejava.service;
 
 import com.github.feng111627.datasetqueryservicejava.error.ClientException;
 import com.github.feng111627.datasetqueryservicejava.error.ErrorCode;
+import com.github.feng111627.datasetqueryservicejava.model.BackfillRequest;
+import com.github.feng111627.datasetqueryservicejava.model.BackfillResult;
 import com.github.feng111627.datasetqueryservicejava.model.DatasetSchema;
 import com.github.feng111627.datasetqueryservicejava.model.FieldDef;
 import com.github.feng111627.datasetqueryservicejava.model.QueryRequest;
 import com.github.feng111627.datasetqueryservicejava.model.QueryResult;
+import com.github.feng111627.datasetqueryservicejava.model.SchemaView;
 import com.github.feng111627.datasetqueryservicejava.model.Snapshot;
 import com.github.feng111627.datasetqueryservicejava.query.QueryEngine;
 import com.github.feng111627.datasetqueryservicejava.schema.SchemaCompatibility;
@@ -19,7 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/** Orchestrates schema registration, record writes and queries. */
+/** Orchestrates schema registration/evolution, record writes, backfills and queries. */
 @Service
 public class DatasetService {
 
@@ -36,30 +39,31 @@ public class DatasetService {
         this.queryEngine = queryEngine;
     }
 
-    /** Registers (or compatibly re-registers) a dataset schema. */
-    public DatasetSchema registerSchema(DatasetSchema schema) {
+    /**
+     * Registers the initial schema or accepts a compatible evolution. The
+     * compatibility check and the install are one atomic store operation, so
+     * concurrent evolutions are serialized: once an evolution is accepted its
+     * new fields are immediately live for writes, schema queries and queries.
+     * Returns the versioned schema view including the evolution history.
+     */
+    public SchemaView registerSchema(DatasetSchema schema) {
         validateSchemaDeclaration(schema);
-        DatasetSchema existing = store.schemaOf(schema.name());
-        if (existing != null) {
-            compatibility.checkCompatible(existing, schema);
-            // compatible re-registration keeps the already stored data and schema
-            return existing;
-        }
-        return store.registerSchema(schema);
+        return store.commitSchema(schema, compatibility::checkCompatible, compatibility::diff);
     }
 
-    public DatasetSchema schemaOf(String dataset) {
-        DatasetSchema schema = store.schemaOf(dataset);
-        if (schema == null) {
+    /** Returns the current schema with its version and evolution history. */
+    public SchemaView schemaView(String dataset) {
+        SchemaView view = store.schemaView(dataset);
+        if (view == null) {
             throw new ClientException(ErrorCode.SCHEMA_NOT_FOUND,
                     "dataset '" + dataset + "' is not registered");
         }
-        return schema;
+        return view;
     }
 
     /** Validates and appends records; returns assigned sequence numbers. */
     public List<Long> writeRecords(String dataset, List<Map<String, Object>> records) {
-        DatasetSchema schema = schemaOf(dataset);
+        DatasetSchema schema = requireSchema(dataset);
         if (records == null || records.isEmpty()) {
             throw new ClientException(ErrorCode.VALIDATION_ERROR,
                     "request body must contain a non-empty 'records' array");
@@ -90,14 +94,77 @@ public class DatasetService {
         return store.append(dataset, records);
     }
 
+    /**
+     * Backfills one optional field on every existing record currently missing
+     * it. The whole fill is one atomic store operation at a single sequence
+     * point, so a reader always sees either all records pre-backfill or all
+     * post-backfill. Validation failures leave the data untouched and can be
+     * retried; a retry carrying the same idempotency key changes nothing and
+     * never overwrites values written after the first successful backfill.
+     */
+    public BackfillResult backfill(String dataset, BackfillRequest request) {
+        DatasetSchema schema = requireSchema(dataset);
+        if (request == null || request.field() == null || request.field().isBlank()) {
+            throw new ClientException(ErrorCode.VALIDATION_ERROR,
+                    "backfill must specify a 'field'");
+        }
+        FieldDef field = schema.field(request.field());
+        if (field == null) {
+            throw new ClientException(ErrorCode.UNKNOWN_FIELD,
+                    "cannot backfill field '" + request.field()
+                            + "': it is not declared in the current schema",
+                    List.of(request.field()));
+        }
+        Object value = request.value();
+        if (value == null) {
+            throw new ClientException(ErrorCode.VALIDATION_ERROR,
+                    "backfill value must not be null; backfilling a null is indistinguishable"
+                            + " from an absent field and changes no data");
+        }
+        if (!typeMatches(field, value)) {
+            throw new ClientException(ErrorCode.TYPE_MISMATCH,
+                    "backfill value has the wrong type",
+                    List.of(field.name() + " (expected " + field.type()
+                            + ", got " + value.getClass().getSimpleName() + ")"));
+        }
+        DatasetStore.BackfillOutcome outcome =
+                store.backfill(dataset, field.name(), value, normalizeKey(request.idempotencyKey()));
+        return new BackfillResult(field.name(), value, outcome.backfilled(),
+                outcome.seq(), outcome.schemaVersion(), outcome.replayed(),
+                normalizeKey(request.idempotencyKey()));
+    }
+
+    private static String normalizeKey(String key) {
+        return key == null || key.isBlank() ? null : key;
+    }
+
+    private boolean typeMatches(FieldDef field, Object value) {
+        return switch (field.type()) {
+            case STRING -> value instanceof String;
+            case BOOLEAN -> value instanceof Boolean;
+            case INTEGER -> value instanceof Byte || value instanceof Short
+                    || value instanceof Integer || value instanceof Long;
+            case DOUBLE -> value instanceof Number;
+        };
+    }
+
     public QueryResult query(String dataset, QueryRequest request) {
-        DatasetSchema schema = schemaOf(dataset);
-        // A snapshotSeq token pins the read to the same snapshot across pages;
-        // without one, a fresh snapshot is taken for this request.
+        // Resolve schema and snapshot together: the current schema governs
+        // validation/projection while the snapshot pins the record view.
+        SchemaView view = schemaView(dataset);
         Snapshot snapshot = request != null && request.snapshotSeq() != null
                 ? store.snapshot(dataset, request.snapshotSeq())
                 : store.snapshot(dataset);
-        return queryEngine.execute(schema, snapshot, request);
+        return queryEngine.execute(view.schema(), view.version(), snapshot, request);
+    }
+
+    private DatasetSchema requireSchema(String dataset) {
+        DatasetSchema schema = store.schemaOf(dataset);
+        if (schema == null) {
+            throw new ClientException(ErrorCode.SCHEMA_NOT_FOUND,
+                    "dataset '" + dataset + "' is not registered");
+        }
+        return schema;
     }
 
     private void validateSchemaDeclaration(DatasetSchema schema) {

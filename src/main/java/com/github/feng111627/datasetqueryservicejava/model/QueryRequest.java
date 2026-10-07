@@ -20,7 +20,13 @@ public record QueryRequest(
     public record Filter(String field, Op op, Object value) {
     }
 
-    public enum Op { EQ, NE, GT, GTE, LT, LTE }
+    public enum Op {
+        EQ, NE, GT, GTE, LT, LTE,
+        /** Matches records whose field value is null or absent (value must be null). */
+        IS_NULL,
+        /** Matches records whose field value is present and non-null (value must be null). */
+        IS_NOT_NULL
+    }
 
     public record Aggregation(AggFunc func, String field, String alias) {
     }
